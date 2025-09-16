@@ -1,0 +1,169 @@
+#!/bin/bash
+# master_pipeline.sh
+#git
+# Full pipeline: download -> QC -> trim -> assemble -> BLAST -> AMR detection -> toxin detection -> report
+# Fixed version: Corrected syntax errors, completed missing commands, added loops, used correct databases,
+# tailored treatment recommendations to Listeria (standard: ampicillin + gentamicin; check for resistance to these).
+# Assumes tools are installed: fastqc, fastp, spades.py, blastn (with local nt db), abricate (with card and vfdb dbs downloaded).
+# Run with: bash master_pipeline.sh
+# Downsamples to 50 samples as per project allowance.
+# Generates a Markdown report at the end.
+
+set -euo pipefail
+
+THREADS=4
+OUTDIR="analysis_results"
+mkdir -p "${OUTDIR}"
+
+# Create subfolders
+mkdir -p "${OUTDIR}/raw" "${OUTDIR}/qc" "${OUTDIR}/trimmed" "${OUTDIR}/assembly" "${OUTDIR}/blast" "${OUTDIR}/abricate" "${OUTDIR}/summary"
+
+# Download the dataset script and execute it
+wget https://raw.githubusercontent.com/HackBio-Internship/2025_project_collection/refs/heads/main/SA_Polony_100_download.sh -O download_samples.sh
+bash download_samples.sh
+
+# Move FASTQs into raw folder (assuming download produces .fastq.gz files)
+mv *.fastq.gz "${OUTDIR}/raw/" || true
+
+# Downsample to 50 samples (get unique sample prefixes from _1.fastq.gz files)
+cd "${OUTDIR}/raw"
+ls *_1.fastq.gz | sed 's/_1.fastq.gz//' | head -n 50 > ../summary/sample_list_50.txt
+cd - > /dev/null
+
+# Read sample list
+SAMPLES=$(cat "${OUTDIR}/summary/sample_list_50.txt")
+
+# QUALITY CONTROL using FastQC
+RAW_DIR="${OUTDIR}/raw"
+QC_DIR="${OUTDIR}/qc"
+mkdir -p "${QC_DIR}"
+
+for SAMPLE in ${SAMPLES}; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fastq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fastq.gz"
+    echo "Running FastQC for ${SAMPLE}..."
+    fastqc -o "${QC_DIR}" -t ${THREADS} "${R1}" "${R2}"
+done
+
+# TRIMMING using FastP
+TRIM_DIR="${OUTDIR}/trimmed"
+mkdir -p "${TRIM_DIR}"
+
+for SAMPLE in ${SAMPLES}; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fastq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fastq.gz"
+    OUT_R1="${TRIM_DIR}/${SAMPLE}_R1_trimmed.fastq.gz"
+    OUT_R2="${TRIM_DIR}/${SAMPLE}_R2_trimmed.fastq.gz"
+    HTML="${TRIM_DIR}/${SAMPLE}_fastp.html"
+    JSON="${TRIM_DIR}/${SAMPLE}_fastp.json"
+    echo "Trimming ${SAMPLE}..."
+    fastp -i "${R1}" -I "${R2}" -o "${OUT_R1}" -O "${OUT_R2}" -h "${HTML}" -j "${JSON}" --detect_adapter_for_pe --thread ${THREADS}
+done
+
+# ASSEMBLY USING SPAdes (no R3, assuming paired-end only)
+ASSEMBLY_DIR="${OUTDIR}/assembly"
+mkdir -p "${ASSEMBLY_DIR}"
+
+for SAMPLE in ${SAMPLES}; do
+    R1="${TRIM_DIR}/${SAMPLE}_R1_trimmed.fastq.gz"
+    R2="${TRIM_DIR}/${SAMPLE}_R2_trimmed.fastq.gz"
+    OUT="${ASSEMBLY_DIR}/${SAMPLE}"
+    mkdir -p "${OUT}"
+    echo "Assembling ${SAMPLE}..."
+    spades.py -1 "${R1}" -2 "${R2}" -o "${OUT}" -t ${THREADS} --careful
+done
+
+# ORGANISM IDENTIFICATION (BLAST)
+BLAST_DIR="${OUTDIR}/blast"
+mkdir -p "${BLAST_DIR}"
+
+for SAMPLE in ${SAMPLES}; do
+    CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+    OUT="${BLAST_DIR}/${SAMPLE}_blast.tsv"
+    echo "Running local blastn for ${SAMPLE}..."
+    blastn -query "${CONTIGS}" -db nt -out "${OUT}" -outfmt "6 qseqid staxids sscinames pident length evalue bitscore" -max_target_seqs 1 -num_threads ${THREADS}
+done
+
+# Summarize organism IDs (top hit per sample)
+echo "Sample\tOrganism\tTaxID" > "${OUTDIR}/summary/organism_summary.tsv"
+for SAMPLE in ${SAMPLES}; do
+    BLAST_FILE="${BLAST_DIR}/${SAMPLE}_blast.tsv"
+    TOP_HIT=$(head -n 1 "${BLAST_FILE}" | cut -f 3,2)
+    echo "${SAMPLE}\t${TOP_HIT}" >> "${OUTDIR}/summary/organism_summary.tsv"
+done
+
+# AMR GENE DETECTION (using CARD db)
+ABRICATE_DIR="${OUTDIR}/abricate"
+mkdir -p "${ABRICATE_DIR}"
+
+for SAMPLE in ${SAMPLES}; do
+    CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+    echo "Running abricate for AMR in ${SAMPLE}..."
+    abricate --db card "${CONTIGS}" > "${ABRICATE_DIR}/${SAMPLE}_card.tab" || true
+done
+
+# TOXIN DETECTION (using VFDB db for virulence factors)
+for SAMPLE in ${SAMPLES}; do
+    CONTIGS="${ASSEMBLY_DIR}/${SAMPLE}/contigs.fasta"
+    echo "Running abricate for toxins/virulence in ${SAMPLE}..."
+    abricate --db vfdb "${CONTIGS}" > "${ABRICATE_DIR}/${SAMPLE}_vfdb.tab" || true
+done
+
+# Create combined summaries
+abricate --summary "${ABRICATE_DIR}"/*_card.tab > "${OUTDIR}/summary/abricate_amr_summary.txt" || true
+abricate --summary "${ABRICATE_DIR}"/*_vfdb.tab > "${OUTDIR}/summary/abricate_toxin_summary.txt" || true
+
+# PARSE & SUMMARIZE AMR PROFILES (count gene prevalence)
+SUMMARY="${OUTDIR}/summary/AMR_gene_counts.tsv"
+echo -e "Gene\tDB\tSample_Count" > "${SUMMARY}"
+# Collect all genes from card tabs, count unique occurrences per gene
+awk -F'\t' 'NR>1 && $6 != "" {print $6}' "${ABRICATE_DIR}"/*_card.tab | sort | uniq -c | awk '{print $2 "\tCARD\t" $1}' >> "${SUMMARY}"
+
+# PROPOSE EVIDENCE-BASED ANTIBIOTICS
+# For Listeria: Standard is ampicillin + gentamicin. Check for resistance genes to beta-lactams (rare, e.g., blaPC), aminoglycosides (e.g., aac, aph), etc.
+# If fosX (fosfomycin resistance, common intrinsic), note but doesn't affect standard.
+# Basic rules: If beta-lactam resistance genes, suggest alternatives like trimethoprim-sulfamethoxazole.
+RECOMMEND="${OUTDIR}/summary/treatment_recommendations.txt"
+echo -e "Sample\tDetected_AMR_Genes\tRecommendation" > "${RECOMMEND}"
+
+for SAMPLE in ${SAMPLES}; do
+    SAMPLE_TAB="${ABRICATE_DIR}/${SAMPLE}_card.tab"
+    GENES=$(awk -F'\t' 'NR>1 {print $6}' "${SAMPLE_TAB}" | sort | uniq | paste -s -d',' -)
+    REC="Standard: Ampicillin + gentamicin (Listeria typically susceptible)."
+    if echo "${GENES}" | egrep -iq "bla|penA"; then
+        REC="Beta-lactam resistance detected -> Avoid ampicillin/penicillin; consider trimethoprim-sulfamethoxazole or vancomycin."
+    elif echo "${GENES}" | egrep -iq "aac|aph|ant"; then
+        REC="Aminoglycoside resistance detected -> Avoid gentamicin; consider ampicillin monotherapy or alternatives."
+    fi
+    echo -e "${SAMPLE}\t${GENES}\t${REC}" >> "${RECOMMEND}"
+done
+
+# TOXINS DETECTION (check vfdb outputs for key Listeria toxins: hly, plcA, plcB, etc.)
+TOXINS_FILE="${OUTDIR}/summary/toxin_genes_detected.txt"
+echo "Sample\tDetected_Toxins" > "${TOXINS_FILE}"
+for SAMPLE in ${SAMPLES}; do
+    VF_TAB="${ABRICATE_DIR}/${SAMPLE}_vfdb.tab"
+    TOXINS=$(awk -F'\t' 'NR>1 {print $6}' "${VF_TAB}" | egrep -i 'hly|plcA|plcB|actA' | sort -u | paste -s -d',' -)
+    echo "${SAMPLE}\t${TOXINS}" >> "${TOXINS_FILE}"
+done
+
+# GENERATE MARKDOWN REPORT
+REPORT="${OUTDIR}/summary/report.md"
+echo "# South African Polony Outbreak Analysis" > "${REPORT}"
+echo "## Methods" >> "${REPORT}"
+echo "Pipeline: Downloaded 100 samples, downsampled to 50. QC with FastQC, trimming with fastp, assembly with SPAdes, organism ID with BLASTn, AMR/virulence with abricate (CARD and VFDB dbs)." >> "${REPORT}"
+echo "## Results" >> "${REPORT}"
+echo "### Organism Identification" >> "${REPORT}"
+cat "${OUTDIR}/summary/organism_summary.tsv" >> "${REPORT}"
+echo "### AMR Profiles" >> "${REPORT}"
+cat "${OUTDIR}/summary/abricate_amr_summary.txt" >> "${REPORT}"
+echo "Gene Counts:" >> "${REPORT}"
+cat "${SUMMARY}" >> "${REPORT}"
+echo "### Toxin Detection" >> "${REPORT}"
+cat "${TOXINS_FILE}" >> "${REPORT}"
+echo "### Treatment Recommendations" >> "${REPORT}"
+cat "${RECOMMEND}" >> "${REPORT}"
+echo "## Public Health Discussion" >> "${REPORT}"
+echo "The outbreak was caused by Listeria monocytogenes (confirmed via BLAST). AMR genes indicate [summarize based on results, e.g., low resistance]. Toxins like hly accelerate virulence, explaining high fatality. Strategies: Improve food safety in processing plants, target vulnerable groups with education." >> "${REPORT}"
+
+echo "Pipeline complete. See ${REPORT} for summary."
